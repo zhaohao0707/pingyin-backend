@@ -1,0 +1,20 @@
+# 使用alpine基础镜像（我们已经下载了）
+FROM alpine:latest
+
+# 安装运行时依赖
+RUN apk --no-cache add ca-certificates sqlite
+
+# 创建工作目录
+WORKDIR /app
+
+# 复制已构建的二进制文件
+COPY main .
+
+# 创建数据目录
+RUN mkdir -p data
+
+# 暴露端口
+EXPOSE 8080
+
+# 运行应用
+CMD ["./main"]
