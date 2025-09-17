@@ -1,24 +1,8 @@
-# 使用Ubuntu基础镜像，更稳定
-FROM ubuntu:22.04
+# 多阶段构建 - 构建阶段
+FROM --platform=$BUILDPLATFORM golang:alpine AS builder
 
-# 安装Go和其他依赖
-RUN apt-get update && apt-get install -y \
-    wget \
-    gcc \
-    libc6-dev \
-    sqlite3 \
-    libsqlite3-dev \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# 安装Go
-RUN wget -O go1.21.0.linux-amd64.tar.gz https://golang.org/dl/go1.21.0.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz && \
-    rm go1.21.0.linux-amd64.tar.gz
-
-ENV PATH=$PATH:/usr/local/go/bin
-ENV GOPATH=/go
-ENV PATH=$PATH:$GOPATH/bin
+# 安装构建依赖
+RUN apk add --no-cache gcc musl-dev sqlite-dev
 
 # 设置工作目录
 WORKDIR /app
@@ -32,11 +16,47 @@ RUN go mod download
 # 复制源代码
 COPY . .
 
-# 构建应用
-RUN CGO_ENABLED=1 go build -o main .
+# 设置交叉编译环境变量
+ARG TARGETOS
+ARG TARGETARCH
+
+# 构建应用 (启用CGO以支持SQLite)
+RUN CGO_ENABLED=1 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -a -ldflags '-linkmode external -extldflags "-static"' -o main .
+
+# 运行阶段 - 使用轻量级基础镜像
+FROM alpine:latest
+
+# 安装运行时依赖
+RUN apk add --no-cache ca-certificates sqlite
+
+# 创建非root用户
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
+
+# 设置工作目录
+WORKDIR /app
+
+# 从构建阶段复制二进制文件
+COPY --from=builder /app/main .
+
+# 创建数据目录并设置权限
+RUN mkdir -p /app/data && \
+    chown -R appuser:appgroup /app
+
+# 切换到非root用户
+USER appuser
+
+# 设置环境变量
+ENV DATABASE_PATH=/app/data/pinyin.db
+ENV GIN_MODE=release
 
 # 暴露端口
 EXPOSE 8080
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/api/words || exit 1
 
 # 运行应用
 CMD ["./main"]

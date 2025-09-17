@@ -22,6 +22,7 @@ type User struct {
 	ID       uint   `json:"id" gorm:"primary_key"`
 	Username string `json:"username" gorm:"unique"`
 	Password string `json:"password"`
+	IsAdmin  bool   `json:"is_admin" gorm:"default:false"`
 }
 
 type Progress struct {
@@ -46,7 +47,8 @@ type Article struct {
 }
 
 type Claims struct {
-	UserID uint `json:"user_id"`
+	UserID  uint `json:"user_id"`
+	IsAdmin bool `json:"is_admin"`
 	jwt.RegisteredClaims
 }
 
@@ -65,6 +67,9 @@ func initDB() {
 
 	// 初始化一些示例数据
 	initSampleData()
+
+	// 创建管理员账户
+	createAdminUser()
 }
 
 func initSampleData() {
@@ -128,6 +133,22 @@ func initSampleData() {
 	}
 }
 
+func createAdminUser() {
+	var admin User
+	err := db.Where("username = ?", "admin").First(&admin).Error
+	if err != nil {
+		// 管理员不存在，创建管理员账户
+		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("zhaohao-admin"), bcrypt.DefaultCost)
+		adminUser := User{
+			Username: "admin",
+			Password: string(hashedPassword),
+			IsAdmin:  true,
+		}
+		db.Create(&adminUser)
+		log.Println("Admin user created: admin/zhaohao-admin")
+	}
+}
+
 func register(c *gin.Context) {
 	var user User
 	if err := c.ShouldBindJSON(&user); err != nil {
@@ -170,7 +191,8 @@ func login(c *gin.Context) {
 
 	expirationTime := time.Now().Add(24 * time.Hour)
 	claims := &Claims{
-		UserID: user.ID,
+		UserID:  user.ID,
+		IsAdmin: user.IsAdmin,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
 		},
@@ -187,6 +209,7 @@ func login(c *gin.Context) {
 		"token":    tokenString,
 		"user_id":  user.ID,
 		"username": user.Username,
+		"is_admin": user.IsAdmin,
 	})
 }
 
@@ -213,6 +236,20 @@ func authMiddleware() gin.HandlerFunc {
 		}
 
 		c.Set("user_id", claims.UserID)
+		c.Set("is_admin", claims.IsAdmin)
+		c.Next()
+	}
+}
+
+// 管理员中间件
+func adminMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		isAdmin, exists := c.Get("is_admin")
+		if !exists || !isAdmin.(bool) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+			c.Abort()
+			return
+		}
 		c.Next()
 	}
 }
@@ -301,6 +338,196 @@ func getProgress(c *gin.Context) {
 	}
 }
 
+// 管理员API - 获取所有用户
+func adminGetUsers(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit := 20
+	offset := (page - 1) * limit
+
+	var users []User
+	var total int64
+
+	db.Model(&User{}).Count(&total)
+	db.Select("id, username, is_admin").Offset(offset).Limit(limit).Find(&users)
+
+	c.JSON(http.StatusOK, gin.H{
+		"users":       users,
+		"total":       total,
+		"page":        page,
+		"total_pages": (total + int64(limit) - 1) / int64(limit),
+	})
+}
+
+// 管理员API - 删除用户
+func adminDeleteUser(c *gin.Context) {
+	userID := c.Param("id")
+
+	// 不能删除管理员账户
+	var user User
+	if err := db.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	if user.IsAdmin {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot delete admin user"})
+		return
+	}
+
+	// 删除用户及其相关数据
+	db.Where("user_id = ?", userID).Delete(&Progress{})
+	db.Delete(&user)
+
+	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
+}
+
+// 管理员API - 获取所有词语
+func adminGetAllWords(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit := 50
+	offset := (page - 1) * limit
+
+	var words []Word
+	var total int64
+
+	db.Model(&Word{}).Count(&total)
+	db.Offset(offset).Limit(limit).Find(&words)
+
+	c.JSON(http.StatusOK, gin.H{
+		"words":       words,
+		"total":       total,
+		"page":        page,
+		"total_pages": (total + int64(limit) - 1) / int64(limit),
+	})
+}
+
+// 管理员API - 添加词语
+func adminAddWord(c *gin.Context) {
+	var word Word
+	if err := c.ShouldBindJSON(&word); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := db.Create(&word).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Word already exists"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Word added successfully", "word": word})
+}
+
+// 管理员API - 更新词语
+func adminUpdateWord(c *gin.Context) {
+	wordID := c.Param("id")
+	var word Word
+
+	if err := db.First(&word, wordID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Word not found"})
+		return
+	}
+
+	var updateData Word
+	if err := c.ShouldBindJSON(&updateData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	word.Word = updateData.Word
+	word.Pinyin = updateData.Pinyin
+	db.Save(&word)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Word updated successfully", "word": word})
+}
+
+// 管理员API - 删除词语
+func adminDeleteWord(c *gin.Context) {
+	wordID := c.Param("id")
+	var word Word
+
+	if err := db.First(&word, wordID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Word not found"})
+		return
+	}
+
+	db.Delete(&word)
+	c.JSON(http.StatusOK, gin.H{"message": "Word deleted successfully"})
+}
+
+// 管理员API - 获取所有文章
+func adminGetAllArticles(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit := 20
+	offset := (page - 1) * limit
+
+	var articles []Article
+	var total int64
+
+	db.Model(&Article{}).Count(&total)
+	db.Offset(offset).Limit(limit).Find(&articles)
+
+	c.JSON(http.StatusOK, gin.H{
+		"articles":    articles,
+		"total":       total,
+		"page":        page,
+		"total_pages": (total + int64(limit) - 1) / int64(limit),
+	})
+}
+
+// 管理员API - 添加文章
+func adminAddArticle(c *gin.Context) {
+	var article Article
+	if err := c.ShouldBindJSON(&article); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := db.Create(&article).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Article title already exists"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Article added successfully", "article": article})
+}
+
+// 管理员API - 更新文章
+func adminUpdateArticle(c *gin.Context) {
+	articleID := c.Param("id")
+	var article Article
+
+	if err := db.First(&article, articleID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Article not found"})
+		return
+	}
+
+	var updateData Article
+	if err := c.ShouldBindJSON(&updateData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	article.Title = updateData.Title
+	article.Content = updateData.Content
+	article.Pinyin = updateData.Pinyin
+	db.Save(&article)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Article updated successfully", "article": article})
+}
+
+// 管理员API - 删除文章
+func adminDeleteArticle(c *gin.Context) {
+	articleID := c.Param("id")
+	var article Article
+
+	if err := db.First(&article, articleID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Article not found"})
+		return
+	}
+
+	db.Delete(&article)
+	c.JSON(http.StatusOK, gin.H{"message": "Article deleted successfully"})
+}
+
 func main() {
 	initDB()
 	defer db.Close()
@@ -333,6 +560,27 @@ func main() {
 		auth.GET("/articles", getArticles)
 		auth.POST("/progress", saveProgress)
 		auth.GET("/progress/:type", getProgress)
+	}
+
+	// 管理员路由
+	admin := r.Group("/admin")
+	admin.Use(authMiddleware(), adminMiddleware())
+	{
+		// 用户管理
+		admin.GET("/users", adminGetUsers)
+		admin.DELETE("/users/:id", adminDeleteUser)
+
+		// 词语管理
+		admin.GET("/words", adminGetAllWords)
+		admin.POST("/words", adminAddWord)
+		admin.PUT("/words/:id", adminUpdateWord)
+		admin.DELETE("/words/:id", adminDeleteWord)
+
+		// 文章管理
+		admin.GET("/articles", adminGetAllArticles)
+		admin.POST("/articles", adminAddArticle)
+		admin.PUT("/articles/:id", adminUpdateArticle)
+		admin.DELETE("/articles/:id", adminDeleteArticle)
 	}
 
 	log.Println("Server starting on :8080")
