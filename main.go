@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jinzhu/gorm"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mozillazg/go-pinyin"
+	"github.com/xuri/excelize/v2"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -381,6 +384,56 @@ func adminDeleteUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
 }
 
+// 管理员API - 提升用户为管理员
+func adminPromoteUser(c *gin.Context) {
+	userID := c.Param("id")
+
+	var user User
+	if err := db.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	if user.IsAdmin {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "User is already an admin"})
+		return
+	}
+
+	// 更新用户为管理员
+	db.Model(&user).Update("is_admin", true)
+
+	c.JSON(http.StatusOK, gin.H{"message": "User promoted to admin successfully"})
+}
+
+// 管理员API - 取消用户管理员权限
+func adminDemoteUser(c *gin.Context) {
+	userID := c.Param("id")
+
+	var user User
+	if err := db.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	if !user.IsAdmin {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "User is not an admin"})
+		return
+	}
+
+	// 检查是否是最后一个管理员
+	var adminCount int64
+	db.Model(&User{}).Where("is_admin = ?", true).Count(&adminCount)
+	if adminCount <= 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot demote the last admin user"})
+		return
+	}
+
+	// 取消管理员权限
+	db.Model(&user).Update("is_admin", false)
+
+	c.JSON(http.StatusOK, gin.H{"message": "User demoted from admin successfully"})
+}
+
 // 管理员API - 获取所有词语
 func adminGetAllWords(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -403,14 +456,36 @@ func adminGetAllWords(c *gin.Context) {
 
 // 管理员API - 添加词语
 func adminAddWord(c *gin.Context) {
-	var word Word
-	if err := c.ShouldBindJSON(&word); err != nil {
+	var requestData struct {
+		Word string `json:"word" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&requestData); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := db.Create(&word).Error; err != nil {
+	// 检查词语是否已存在
+	var existingWord Word
+	if err := db.Where("word = ?", requestData.Word).First(&existingWord).Error; err == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Word already exists"})
+		return
+	}
+
+	// 使用go-pinyin自动生成带声调的拼音
+	args := pinyin.NewArgs()
+	args.Style = pinyin.Tone // 使用声调标记
+	pinyinResult := pinyin.LazyPinyin(requestData.Word, args)
+	pinyinStr := strings.Join(pinyinResult, " ")
+
+	// 创建新词语
+	word := Word{
+		Word:   requestData.Word,
+		Pinyin: pinyinStr,
+	}
+
+	if err := db.Create(&word).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create word"})
 		return
 	}
 
@@ -452,6 +527,101 @@ func adminDeleteWord(c *gin.Context) {
 
 	db.Delete(&word)
 	c.JSON(http.StatusOK, gin.H{"message": "Word deleted successfully"})
+}
+
+// 管理员API - Excel导入词库
+func adminImportWordsFromExcel(c *gin.Context) {
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get file"})
+		return
+	}
+	defer file.Close()
+
+	// 检查文件扩展名
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if ext != ".xlsx" && ext != ".xls" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File must be Excel format (.xlsx or .xls)"})
+		return
+	}
+
+	// 读取Excel文件
+	f, err := excelize.OpenReader(file)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read Excel file"})
+		return
+	}
+	defer f.Close()
+
+	// 获取第一个工作表
+	sheets := f.GetSheetList()
+	if len(sheets) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No sheets found in Excel file"})
+		return
+	}
+
+	sheetName := sheets[0]
+	rows, err := f.GetRows(sheetName)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read sheet data"})
+		return
+	}
+
+	if len(rows) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Excel file is empty"})
+		return
+	}
+
+	var importedCount int
+	var skippedCount int
+	var errorCount int
+
+	// 处理每一行数据
+	for _, row := range rows {
+		// 跳过空行
+		if len(row) == 0 || strings.TrimSpace(row[0]) == "" {
+			continue
+		}
+
+		word := strings.TrimSpace(row[0])
+		if word == "" {
+			continue
+		}
+
+		// 检查词语是否已存在
+		var existingWord Word
+		if err := db.Where("word = ?", word).First(&existingWord).Error; err == nil {
+			skippedCount++
+			continue
+		}
+
+		// 使用go-pinyin自动生成带声调的拼音
+		args := pinyin.NewArgs()
+		args.Style = pinyin.Tone // 使用声调标记
+		pinyinResult := pinyin.LazyPinyin(word, args)
+		pinyinStr := strings.Join(pinyinResult, " ")
+
+		// 创建新词语
+		newWord := Word{
+			Word:   word,
+			Pinyin: pinyinStr,
+		}
+
+		if err := db.Create(&newWord).Error; err != nil {
+			log.Printf("Failed to create word '%s': %v", word, err)
+			errorCount++
+		} else {
+			importedCount++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":        "Import completed",
+		"imported_count": importedCount,
+		"skipped_count":  skippedCount,
+		"error_count":    errorCount,
+		"total_rows":     len(rows),
+	})
 }
 
 // 管理员API - 获取所有文章
@@ -569,12 +739,15 @@ func main() {
 		// 用户管理
 		admin.GET("/users", adminGetUsers)
 		admin.DELETE("/users/:id", adminDeleteUser)
+		admin.POST("/users/:id/promote", adminPromoteUser)
+		admin.POST("/users/:id/demote", adminDemoteUser)
 
 		// 词语管理
 		admin.GET("/words", adminGetAllWords)
 		admin.POST("/words", adminAddWord)
 		admin.PUT("/words/:id", adminUpdateWord)
 		admin.DELETE("/words/:id", adminDeleteWord)
+		admin.POST("/words/import", adminImportWordsFromExcel)
 
 		// 文章管理
 		admin.GET("/articles", adminGetAllArticles)
